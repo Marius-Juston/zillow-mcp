@@ -15,7 +15,7 @@ description: >-
 Zillow fronts `www.zillow.com` with a PerimeterX bot-wall that blocks
 plain `curl`/Node requests, and several tools (saved searches/homes)
 need an actual signed-in session. `fpx` routes every request through the
-user's own signed-in browser tab (the fetchproxy extension), so the
+user's own signed-in browser tab (the ContextMint Bridge extension), so the
 same page loads that a real visit would.
 
 This is the same data the `zillow_*` MCP tools return — every property
@@ -29,12 +29,15 @@ zillow.com tab open."
 ```sh
 npm install -g @fetchproxy/cli             # provides `fpx`
 fpx profile add zillow --domain zillow.com # only the fetch capability is needed
-fpx pair -p zillow                         # prints a pair code → approve in the fetchproxy extension
+fpx pair -p zillow                         # prints a pair code → approve in ContextMint Bridge
 ```
 
-Requirements: the **fetchproxy** browser extension installed, with an
+Requirements: the **ContextMint Bridge** browser extension installed
+([releases](https://github.com/nullnet-app/contextmint-bridge/releases)), with an
 open `www.zillow.com` tab, and its Chrome **Site access** allowing
-`zillow.com`. For the saved-searches/saved-homes calls, that tab must
+`zillow.com`. (ContextMint Bridge is the renamed fetchproxy extension from the
+same maintainer; build it from source or verify the release zip with
+`shasum -a 256 -c contextmint-bridge-chrome-<version>.zip.sha256`.) For the saved-searches/saved-homes calls, that tab must
 also be **signed in**. Pairing persists — after the first approval every
 later `fpx` call reuses it.
 
