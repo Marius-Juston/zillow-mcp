@@ -13,6 +13,7 @@ This is a "Pattern A" fetchproxy MCP (every call rides through fetchproxy), not 
 | Tool | File | Endpoint | Kind |
 | --- | --- | --- | --- |
 | `zillow_search_properties` | `tools/search.ts` | GET `/homes/<location>_rb/?searchQueryState=...` SSR | read |
+| `zillow_sweep_area` | `tools/search.ts` | Same SSR search, per map tile (`searchQueryState.mapBounds`), quartering tiles whose `totalResultCount` exceeds what paging returns | read (optional local file write) |
 | `zillow_get_property` | `tools/properties.ts` | GET SSR `/homedetails/<zpid>_zpid/` (`__NEXT_DATA__` gdpClientCache) | read |
 | `zillow_get_by_address` | `tools/get-by-address.ts` | GET `/homes/<address-slug>_rb/` SSR — shared 4-rung resolver (`resolver.ts`) | read |
 | `zillow_resolve_addresses` | `tools/resolve-addresses.ts` | Batch over the shared resolver (`resolver.ts`), bridge-concurrency-bounded | read |
@@ -63,7 +64,8 @@ src/
   sessions.ts           # re-exports SessionRegistry from
                         #   @chrischall/mcp-utils/session (fleet-shared)
   tools/
-    search.ts           # zillow_search_properties (buildSearchQueryState + formatListing)
+    search.ts           # zillow_search_properties (buildSearchQueryState + formatListing),
+                        #   runRegionSearch (paging + completeness meta), zillow_sweep_area
     properties.ts       # zillow_get_property + the shared fetchPropertyRecord
                         #   (SSR /homedetails/ scrape) + format()
     resolver.ts         # shared 4-rung address resolver (resolveAddressFull)
