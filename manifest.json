@@ -65,7 +65,7 @@
     },
     {
       "name": "zillow_sweep_area",
-      "description": "Exhaustively enumerate Zillow listings in an area by recursive map tiling; writes the full set to a file and reports completeness."
+      "description": "Exhaustively enumerate Zillow listings in an area by recursive map tiling and report completeness; returns the listings inline, or writes them to an optional JSON output_path."
     }
   ]
 }
