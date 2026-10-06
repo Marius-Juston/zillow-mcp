@@ -1,6 +1,6 @@
 import { z } from 'zod';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, extname, isAbsolute } from 'node:path';
 import { FIRST_DIGIT_TO_STATES, tokenize } from '@chrischall/realty-core';
 import { minifiedResult } from '@chrischall/mcp-utils';
 import type { McpServer } from '@modelcontextprotocol/server';
@@ -448,7 +448,7 @@ export interface SearchMeta {
   /** True when Zillow reports more matches than were fetched. */
   truncated: boolean;
   /** Why the page walk stopped. */
-  stop_reason: 'limit' | 'empty_page' | 'repeat_page' | 'single_page' | 'max_pages' | 'page_error' | 'over_split_threshold';
+  stop_reason: 'limit' | 'empty_page' | 'repeat_page' | 'single_page' | 'max_pages' | 'budget' | 'page_error' | 'over_split_threshold';
   /** Set when stop_reason is 'page_error': the error from the page that failed. */
   page_error?: string;
 }
@@ -458,12 +458,20 @@ export interface SearchMeta {
  * limit / an empty page / a repeated page. Returns the listings plus a
  * completeness report so callers can tell a full answer from a capped one.
  */
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 export async function runRegionSearch(
   client: ZillowClient,
   input: SearchInput & { auto_paginate?: boolean },
   region: ResolvedRegion,
   limit: number,
-  opts: { splitAbove?: number } = {}
+  opts: {
+    splitAbove?: number;
+    /** Hard cap on pages fetched (a caller's remaining request budget); hitting it stops with `budget`. */
+    maxPages?: number;
+    /** Pause before every page after the first. */
+    delayMs?: number;
+  } = {}
 ): Promise<{ results: FormattedListing[]; meta: SearchMeta }> {
   const autoPaginate = input.auto_paginate !== false;
   const wantsMore = autoPaginate && limit > ZILLOW_PAGE_SIZE;
@@ -478,9 +486,11 @@ export async function runRegionSearch(
   const drop = (f: FormattedListing, reason: string) => {
     if (dropped.length < 200) dropped.push({ zpid: f.zpid, address: f.address, price: f.price, beds: f.beds, baths: f.baths, home_type: f.home_type, reason });
   };
-  let stop: SearchMeta['stop_reason'] = 'max_pages';
+  const pageCap = Math.min(MAX_PAGES, opts.maxPages ?? MAX_PAGES);
+  let stop: SearchMeta['stop_reason'] = pageCap < MAX_PAGES ? 'budget' : 'max_pages';
   let pageError: string | undefined;
-  for (let page = 1; page <= MAX_PAGES; page++) {
+  for (let page = 1; page <= pageCap; page++) {
+    if (page > 1 && opts.delayMs) await sleep(opts.delayMs);
     const sqs = buildSearchQueryState({ ...input, page }, region);
     let html: string;
     try {
@@ -529,7 +539,7 @@ export async function runRegionSearch(
   // so `fetched` alone can exceed the total while matches are still missing;
   // a shortfall after Zillow ran out of pages is a guard disagreement, which
   // the caller sees as `shortfall` + `dropped`.
-  const stoppedEarly = stop === 'max_pages' || stop === 'limit' || stop === 'single_page' || stop === 'page_error' || stop === 'over_split_threshold';
+  const stoppedEarly = stop === 'max_pages' || stop === 'budget' || stop === 'limit' || stop === 'single_page' || stop === 'page_error' || stop === 'over_split_threshold';
   const truncated = total !== null ? total > fetched || (shortfall > 0 && stoppedEarly) : stoppedEarly;
   return {
     results: aggregated.slice(0, limit),
@@ -865,6 +875,15 @@ export function registerSearchTools(
       if (include_meta) {
         return viewResponse(view, { meta, results });
       }
+      if (meta.stop_reason === 'page_error') {
+        // A deep page failed and earlier pages were kept: never let that pass
+        // as a complete answer just because the caller didn't ask for meta.
+        return viewResponse(view, {
+          warning: `Results truncated: Zillow failed on page ${meta.pages_fetched + 1} (${meta.page_error}); returning the ${results.length} listings from earlier pages.`,
+          meta,
+          results,
+        });
+      }
       return viewResponse(view, results);
     }
   );
@@ -890,9 +909,9 @@ export function registerSearchTools(
         home_types: z.array(z.enum(['house', 'condo', 'townhouse', 'multi_family', 'manufactured', 'land', 'apartment'])).optional(),
         max_depth: z.number().int().min(0).max(8).optional().describe('Max quarterings per tile (default 6).'),
         tile_cap: z.number().int().positive().max(1000).optional().describe('Treat a tile as complete only if its total is at most this (default 400).'),
-        delay_ms: z.number().int().min(0).max(10000).optional().describe('Pause between requests (default 1200).'),
-        max_requests: z.number().int().positive().max(400).optional().describe('Hard request budget (default 150).'),
-        output_path: z.string().optional().describe('Optional absolute path of a JSON file to write the full results (and per-tile counts) to. Omit to get the results inline; use a file for large areas so the listings stay out of the conversation.'),
+        delay_ms: z.number().int().min(0).max(10000).optional().describe('Pause before every Zillow request, including each page within a tile (default 1200).'),
+        max_requests: z.number().int().positive().max(400).optional().describe('Hard request budget (default 150), counting the resolve call and every page; the sweep stops mid-tile rather than exceed it.'),
+        output_path: z.string().optional().describe('Optional absolute path of a NEW .json file to write the full results (and per-tile counts) to; an existing file is never overwritten. Omit to get the results inline; use a file for large areas so the listings stay out of the conversation.'),
       }),
     },
     async (input) => {
@@ -926,6 +945,17 @@ export function filterFailure(f: FormattedListing, input: SearchInput): string {
   return 'other';
 }
 
+/**
+ * `output_path` comes from the model, so guard it before any request: an
+ * absolute path (a relative one would land wherever the server's cwd is), a
+ * `.json` file (not a dotfile or script), and never an existing file.
+ */
+export function assertWritableOutputPath(p: string): void {
+  if (!isAbsolute(p)) throw new Error(`output_path must be an absolute path; got "${p}".`);
+  if (extname(p).toLowerCase() !== '.json') throw new Error(`output_path must end in .json; got "${p}".`);
+  if (existsSync(p)) throw new Error(`output_path ${p} already exists; refusing to overwrite it. Pass a new file path.`);
+}
+
 /** Split a box into four quadrants. */
 export function quarter(b: MapBounds): MapBounds[] {
   const mLat = (b.north + b.south) / 2;
@@ -943,6 +973,7 @@ export async function sweepArea(client: ZillowClient, input: SweepInput) {
   const tileCap = input.tile_cap ?? 400;
   const delay = input.delay_ms ?? 1200;
   const budget = input.max_requests ?? 150;
+  if (input.output_path !== undefined) assertWritableOutputPath(input.output_path);
   const resolved = await resolveLocationOrListings(client, input.location);
   if (resolved.kind !== 'region') {
     throw new LocationNotResolved(input.location, 'sweeps need a region (city, ZIP, county), not an address');
@@ -955,7 +986,6 @@ export async function sweepArea(client: ZillowClient, input: SweepInput) {
   const warnings = new Set<string>();
   let requests = 1; // the resolve call
   let budgetHit = false;
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const queue: Array<{ id: string; b: MapBounds; depth: number }> = [{ id: 't', b: root, depth: 0 }];
   while (queue.length) {
     const t = queue.shift()!;
@@ -968,7 +998,7 @@ export async function sweepArea(client: ZillowClient, input: SweepInput) {
       { location: input.location, status: input.status, price_min: input.price_min, price_max: input.price_max, beds_min: input.beds_min, baths_min: input.baths_min, home_types: input.home_types, map_bounds: t.b, auto_paginate: true },
       resolved.region,
       SEARCH_LIMIT_MAX,
-      { splitAbove: t.depth < maxDepth ? tileCap : undefined }
+      { splitAbove: t.depth < maxDepth ? tileCap : undefined, maxPages: budget - requests, delayMs: delay }
     );
     } catch (e) {
       // One failing tile must not discard the rest of the sweep.
@@ -979,6 +1009,7 @@ export async function sweepArea(client: ZillowClient, input: SweepInput) {
     }
     const { results, meta } = res;
     requests += meta.pages_fetched;
+    if (meta.stop_reason === 'budget') budgetHit = true;
     if (meta.stop_reason === 'page_error') warnings.add('Zillow refused a deep result page (HTTP error) on some tiles; those tiles kept what earlier pages returned and count as truncated.');
     if (meta.total_result_count === null) warnings.add('Zillow returned no total count on some tiles (shape drift?) — completeness for those tiles inferred from paging only.');
     if (meta.dropped_filter_guard > 0) warnings.add('Zillow returned listings outside the numeric filters; they were dropped by the guard (filter drift).');
@@ -1014,7 +1045,15 @@ export async function sweepArea(client: ZillowClient, input: SweepInput) {
   };
   if (input.output_path) {
     mkdirSync(dirname(input.output_path), { recursive: true });
-    writeFileSync(input.output_path, JSON.stringify(out, null, 1));
+    try {
+      // 'wx': never clobber a file that appeared while the sweep ran.
+      writeFileSync(input.output_path, JSON.stringify(out, null, 1), { flag: 'wx' });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new Error(`output_path ${input.output_path} already exists; refusing to overwrite it. Pass a new file path.`);
+      }
+      throw e;
+    }
   }
   return {
     ...(input.output_path ? { output_path: input.output_path } : {}),

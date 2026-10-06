@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ZillowClient } from '../../src/client.js';
@@ -40,6 +40,7 @@ function page(list: RawListing[], total?: number, where: 'searchList' | 'categor
 const fetchHtml = vi.fn();
 const client = { fetchHtml } as unknown as ZillowClient;
 beforeEach(() => fetchHtml.mockReset());
+afterEach(() => vi.useRealTimers());
 
 describe('totalResultCount', () => {
   it('reads cat1.searchList, then categoryTotals, else null', () => {
@@ -187,5 +188,64 @@ describe('deep-page errors and early splits', () => {
     expect(s.complete).toBe(false);
     expect(s.tile_errors?.[0]).toMatchObject({ id: 't0' });
     expect(s.unique_listings).toBe(3);
+  });
+});
+
+describe('sweep request budget is a hard limit', () => {
+  const forty = (base: number) => Array.from({ length: 40 }, (_, i) => listing(base + i + 1, 700_000));
+  it('runRegionSearch stops at maxPages with a budget stop reason', async () => {
+    fetchHtml.mockResolvedValueOnce(page(forty(0), 900)).mockResolvedValueOnce(page(forty(40), 900)).mockResolvedValueOnce(page(forty(80), 900));
+    const { results, meta } = await runRegionSearch(client, { location: 'x' }, region, 1000, { maxPages: 2 });
+    expect(fetchHtml).toHaveBeenCalledTimes(2);
+    expect(results).toHaveLength(80);
+    expect(meta).toMatchObject({ stop_reason: 'budget', pages_fetched: 2, truncated: true });
+  });
+  it('a deep max-depth tile cannot overrun max_requests', async () => {
+    fetchHtml.mockResolvedValueOnce(page([listing(999, 1)], 1)); // resolve
+    for (let p = 0; p < 10; p++) fetchHtml.mockResolvedValueOnce(page(forty(p * 40), 900));
+    const s = await sweepArea(client, { location: 'San Jose, CA', delay_ms: 0, max_depth: 0, max_requests: 3 });
+    expect(fetchHtml).toHaveBeenCalledTimes(3);
+    expect(s.requests).toBe(3);
+    expect(s.budget_hit).toBe(true);
+    expect(s.complete).toBe(false);
+  });
+});
+
+describe('sweep delay applies between every request', () => {
+  it('runRegionSearch pauses delayMs between pages of one tile', async () => {
+    vi.useFakeTimers();
+    const p1 = Array.from({ length: 40 }, (_, i) => listing(i + 1, 700_000));
+    fetchHtml.mockResolvedValueOnce(page(p1, 41)).mockResolvedValueOnce(page([listing(41, 1)], 41)).mockResolvedValueOnce(page([], 41));
+    const run = runRegionSearch(client, { location: 'x' }, region, 1000, { delayMs: 1000 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchHtml).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetchHtml).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchHtml).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetchHtml).toHaveBeenCalledTimes(3);
+    const { meta } = await run;
+    expect(meta.pages_fetched).toBe(3);
+  });
+});
+
+describe('sweep output_path validation', () => {
+  it('rejects a relative path before any request', async () => {
+    await expect(sweepArea(client, { location: 'San Jose, CA', delay_ms: 0, output_path: 'out/z.json' })).rejects.toThrow(/absolute/);
+    expect(fetchHtml).not.toHaveBeenCalled();
+  });
+  it('rejects a path without a .json extension', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sweep-'));
+    await expect(sweepArea(client, { location: 'San Jose, CA', delay_ms: 0, output_path: join(dir, '.bashrc') })).rejects.toThrow(/\.json/);
+    expect(fetchHtml).not.toHaveBeenCalled();
+  });
+  it('refuses to overwrite an existing file', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sweep-'));
+    const out = join(dir, 'z.json');
+    writeFileSync(out, 'keep me');
+    await expect(sweepArea(client, { location: 'San Jose, CA', delay_ms: 0, output_path: out })).rejects.toThrow(/already exists/);
+    expect(readFileSync(out, 'utf8')).toBe('keep me');
+    expect(fetchHtml).not.toHaveBeenCalled();
   });
 });
