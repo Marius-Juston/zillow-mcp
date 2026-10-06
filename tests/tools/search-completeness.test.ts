@@ -209,6 +209,15 @@ describe('sweep request budget is a hard limit', () => {
     expect(s.budget_hit).toBe(true);
     expect(s.complete).toBe(false);
   });
+  it('a tile that exactly uses up the budget without truncation is not a budget hit', async () => {
+    fetchHtml.mockResolvedValueOnce(page([listing(999, 1)], 1)); // resolve
+    fetchHtml.mockResolvedValueOnce(page(forty(0), 80)).mockResolvedValueOnce(page(forty(40), 80));
+    const s = await sweepArea(client, { location: 'San Jose, CA', delay_ms: 0, max_depth: 0, max_requests: 3 }); // resolve + 2 pages
+    expect(s.requests).toBe(3);
+    expect(s.unique_listings).toBe(80);
+    expect(s.budget_hit).toBe(false);
+    expect(s.complete).toBe(true);
+  });
 });
 
 describe('sweep delay applies between every request', () => {

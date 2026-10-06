@@ -1009,7 +1009,7 @@ export async function sweepArea(client: ZillowClient, input: SweepInput) {
     }
     const { results, meta } = res;
     requests += meta.pages_fetched;
-    if (meta.stop_reason === 'budget') budgetHit = true;
+    if (meta.stop_reason === 'budget' && meta.truncated) budgetHit = true;
     if (meta.stop_reason === 'page_error') warnings.add('Zillow refused a deep result page (HTTP error) on some tiles; those tiles kept what earlier pages returned and count as truncated.');
     if (meta.total_result_count === null) warnings.add('Zillow returned no total count on some tiles (shape drift?) — completeness for those tiles inferred from paging only.');
     if (meta.dropped_filter_guard > 0) warnings.add('Zillow returned listings outside the numeric filters; they were dropped by the guard (filter drift).');
